@@ -14,14 +14,14 @@
 #  
 #  
 #  作者: Zyx0rx
-#  项目地址: https://github.com/Zyx0rx/vless-all-in-one
+#  项目地址: https://github.com/zzzqqiu/minitool/blob/main/vless-server.sh
 #═══════════════════════════════════════════════════════════════════════════════
 
 readonly VERSION="3.5.3"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/Zyx0rx/vless-all-in-one"
+readonly REPO_URL="https://github.com/zzzqqiu/minitool/blob/main/vless-server.sh"
 readonly SCRIPT_REPO="Zyx0rx/vless-all-in-one"
-readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh"
+readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/zzzqqiu/minitool/blob/main/vless-server.sh"
 readonly CFG="/etc/vless-reality"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
@@ -1780,7 +1780,7 @@ check_daily_report() {
 #  流量统计函数 - 基于 Xray Stats API
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly XRAY_API_PORT=10085
+readonly XRAY_API_PORT="${XRAY_API_PORT:-10085}"
 readonly TRAFFIC_INTERVAL_FILE="$CFG/traffic_interval"
 readonly TRAFFIC_MONTHLY_RESET_ENABLED_FILE="$CFG/traffic_monthly_reset_enabled"
 readonly TRAFFIC_MONTHLY_RESET_DAY_FILE="$CFG/traffic_monthly_reset_day"
@@ -2010,7 +2010,7 @@ sync_all_user_traffic() {
     
     # 使用临时文件存储 API 结果，避免内存问题
     local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
+    trap "rm -f '$tmp_stats'" RETURN EXIT
     : > "$tmp_stats"
     
     # 一次性获取所有流量统计（带重置选项）
@@ -2040,39 +2040,60 @@ sync_all_user_traffic() {
     # 定义告警阈值档位（依次检查，每档只发一次）
     local -a alert_thresholds=(80 90 95)
     
-    # 遍历所有 Xray 协议
+    # 第1轮: 批量写入流量（所有协议、所有用户一次性 jq）
     for proto in $(db_list_protocols "xray"); do
-        local users=$(db_list_users "xray" "$proto")
-        [[ -z "$users" ]] && continue
-        
-        for user in $users; do
-            local email="${user}@${proto}"
-            local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            
-            uplink=${uplink:-0}
-            downlink=${downlink:-0}
-            local traffic=$((uplink + downlink))
-            
-            if [[ "$traffic" -gt 0 ]]; then
-                db_update_user_traffic "xray" "$proto" "$user" "$traffic"
+        if _batch_update_traffic "xray" "$proto" "$tmp_stats"; then
+            ((updated++))
+        fi
+    done
+
+    # Sing-box 协议
+    if [[ "$has_singbox" == "true" ]] && singbox_stats_available; then
+        for proto in hy2 tuic anytls; do
+            db_exists "singbox" "$proto" || continue
+            if _batch_update_traffic "singbox" "$proto" "$tmp_stats"; then
                 ((updated++))
-                
-                local quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
-                local used=$(db_get_user_field "xray" "$proto" "$user" "used")
-                
+            fi
+        done
+    fi
+
+    # 第2轮: 读取更新后的 DB 一次，检查配额/告警
+    for core in xray singbox; do
+        local proto_list=
+        proto_list=$(db_list_protocols "$core" 2>/dev/null)
+        [[ -z "$proto_list" ]] && continue
+        for proto in $proto_list; do
+            # 一次性读取所有用户数据 (字段: name, used, quota, enabled)
+            local user_data=
+            user_data=$(jq -r --arg c "$core" --arg p "$proto" '
+                .[$c][$p] as $cfg |
+                if $cfg == null then empty
+                elif ($cfg | type) == "array" then
+                    $cfg[].users // [] | .[] | "\(.name)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\(.expire_date // "")"
+                else
+                    $cfg.users // [] | .[] | "\(.name)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\(.expire_date // "")"
+                end
+            ' "$DB_FILE" 2>/dev/null)
+            [[ -z "$user_data" ]] && continue
+
+            # 逐用户检查配额，只有超限或接近才触发 jq 写入
+            while IFS='|' read -r name used quota enabled expire_date; do
+                [[ -z "$name" ]] && continue
+                used=${used:-0}
+                quota=${quota:-0}
+
                 if [[ "$quota" -gt 0 ]]; then
                     local percent=$((used * 100 / quota))
                     if [[ "$used" -ge "$quota" ]]; then
-                        local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
+                        local exceeded_notified=$(db_get_user_alert_state "$core" "$proto" "$name" "quota_exceeded_notified")
                         if [[ "$exceeded_notified" != "true" ]]; then
-                            db_set_user_enabled "xray" "$proto" "$user" "false"
-                            db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                            tg_send_over_quota "$user" "$proto" "$used" "$quota"
-                            need_reload=true
+                            db_set_user_enabled "$core" "$proto" "$name" "false"
+                            db_set_user_alert_state "$core" "$proto" "$name" "quota_exceeded_notified" "true"
+                            tg_send_over_quota "$name" "$proto" "$used" "$quota"
+                            [[ "$core" == "xray" ]] && need_reload=true
                         fi
                     elif [[ "$percent" -ge "$notify_percent" ]]; then
-                        local last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
+                        local last_alert=$(db_get_user_alert_state "$core" "$proto" "$name" "last_alert_percent")
                         last_alert=${last_alert:-0}
                         local should_alert=false
                         local current_threshold=0
@@ -2083,69 +2104,14 @@ sync_all_user_traffic() {
                             fi
                         done
                         if [[ "$should_alert" == "true" ]]; then
-                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
-                            db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                            tg_send_quota_alert "$name" "$proto" "$used" "$quota" "$percent"
+                            db_set_user_alert_state "$core" "$proto" "$name" "last_alert_percent" "$current_threshold"
                         fi
                     fi
                 fi
-            fi
+            done <<< "$user_data"
         done
     done
-
-    # 遍历所有 Sing-box 协议（当前已接入 HY2 / TUIC / AnyTLS 用户级统计）
-    if [[ "$has_singbox" == "true" ]] && singbox_stats_available; then
-        for proto in hy2 tuic anytls; do
-            db_exists "singbox" "$proto" || continue
-            local mappings=$(_get_singbox_stat_user_mappings "$proto")
-            [[ -z "$mappings" ]] && continue
-
-            while IFS='|' read -r user stat_key; do
-                [[ -z "$user" || -z "$stat_key" ]] && continue
-
-                local uplink=$(grep -F "user>>>${stat_key}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-                local downlink=$(grep -F "user>>>${stat_key}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-
-                uplink=${uplink:-0}
-                downlink=${downlink:-0}
-                local traffic=$((uplink + downlink))
-
-                if [[ "$traffic" -gt 0 ]]; then
-                    db_update_user_traffic "singbox" "$proto" "$user" "$traffic"
-                    ((updated++))
-
-                    local quota=$(db_get_user_field "singbox" "$proto" "$user" "quota")
-                    local used=$(db_get_user_field "singbox" "$proto" "$user" "used")
-
-                    if [[ "$quota" -gt 0 ]]; then
-                        local percent=$((used * 100 / quota))
-                        if [[ "$used" -ge "$quota" ]]; then
-                            local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
-                            if [[ "$exceeded_notified" != "true" ]]; then
-                                db_set_user_enabled "singbox" "$proto" "$user" "false"
-                                db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
-                                tg_send_over_quota "$user" "$proto" "$used" "$quota"
-                            fi
-                        elif [[ "$percent" -ge "$notify_percent" ]]; then
-                            local last_alert=$(db_get_user_alert_state "singbox" "$proto" "$user" "last_alert_percent")
-                            last_alert=${last_alert:-0}
-                            local should_alert=false
-                            local current_threshold=0
-                            for threshold in "${alert_thresholds[@]}"; do
-                                if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
-                                    should_alert=true
-                                    current_threshold=$threshold
-                                fi
-                            done
-                            if [[ "$should_alert" == "true" ]]; then
-                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
-                                db_set_user_alert_state "singbox" "$proto" "$user" "last_alert_percent" "$current_threshold"
-                            fi
-                        fi
-                    fi
-                fi
-            done <<< "$mappings"
-        done
-    fi
     
     rm -f "$tmp_stats"
     
@@ -2158,6 +2124,60 @@ sync_all_user_traffic() {
     return 0
 }
 
+#═══════════════════════════════════════════════════════════════════════════════
+#  批量流量同步辅助函数 (性能优化: 避免每用户独立 jq 调用)
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 对指定协议批量更新所有用户的流量增量
+# 用法: _batch_update_traffic <core> <proto> <tmp_stats_file>
+# tmp_stats_file 格式: user>>>user@proto>>>traffic>>>uplink NN\n user>>>user@proto>>>traffic>>>downlink NN
+# 返回: 写入 updated_users 数组变量 (name|used|quota) 供调用方使用
+_batch_update_traffic() {
+    local core="$1" proto="$2" stats_file="$3"
+    local tmp_pairs=$(mktemp)
+    trap "rm -f '$tmp_pairs'" RETURN EXIT
+
+    # Step 1: 从 stats 文件中提取本协议所有用户的上行+下行流量
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        local email="${user}@${proto}"
+        local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$stats_file" 2>/dev/null | awk '{print $NF}')
+        local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$stats_file" 2>/dev/null | awk '{print $NF}')
+        uplink=${uplink:-0}
+        downlink=${downlink:-0}
+        local traffic=$((uplink + downlink))
+        [[ "$traffic" -eq 0 ]] && continue
+        printf '%s|%s\n' "$user" "$traffic" >> "$tmp_pairs"
+    done <<< "$(db_list_users "$core" "$proto")"
+
+    [[ ! -s "$tmp_pairs" ]] && { rm -f "$tmp_pairs"; return 1; }
+
+    # Step 2: 用一次 jq 调用把 user|traffic 文件转为 conditions JSON
+    local conditions_json=$(jq -Rn --arg c "$core" --arg p "$proto" '
+        [inputs | select(length > 0) | split("|") | {core: $c, proto: $p, user: .[0], bytes: (.[1] | tonumber)}]
+    ' < "$tmp_pairs" 2>/dev/null)
+    rm -f "$tmp_pairs"
+
+    [[ -z "$conditions_json" || "$conditions_json" == "[]" || "$conditions_json" == "null" ]] && return 1
+
+    # Step 3: 单次 jq 调用，reduce 遍历所有 conditions 一次性更新
+    local tmp_file="${DB_FILE}.tmp"
+    jq --argjson conditions "$conditions_json" '
+        reduce $conditions[] as $c (
+            .;
+            .[$c.core][$c.proto] as $cfg |
+            if ($cfg | type) == "array" then
+                .[$c.core][$c.proto] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $c.user then .used += $c.bytes else . end])]
+            else
+                .[$c.core][$c.proto].users = ([.[$c.core][$c.proto].users // [] | .[] | if .name == $c.user then .used += $c.bytes else . end])
+            end
+        )
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    _db_touch
+
+    return 0
+}
+
 # 获取所有用户流量统计 (用于显示)
 # 输出格式: proto|user|uplink|downlink|total
 # 支持 Xray + Sing-box（当前已接入 HY2 / TUIC / AnyTLS 的用户级统计）
@@ -2167,7 +2187,7 @@ get_all_traffic_stats() {
 
     # 使用临时文件存储，避免大变量导致内存问题
     local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
+    trap "rm -f '$tmp_stats'" RETURN EXIT
     : > "$tmp_stats"
 
     # === Xray 流量统计 ===
@@ -2185,10 +2205,8 @@ get_all_traffic_stats() {
 
     # 遍历 Xray 用户
     for proto in $(db_list_protocols "xray"); do
-        local users=$(db_list_users "xray" "$proto")
-        [[ -z "$users" ]] && continue
-
-        for user in $users; do
+        while IFS= read -r user; do
+            [[ -z "$user" ]] && continue
             local email="${user}@${proto}"
 
             local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
@@ -2201,7 +2219,7 @@ get_all_traffic_stats() {
             if [[ "$total" -gt 0 ]]; then
                 echo "${proto}|${user}|${uplink}|${downlink}|${total}"
             fi
-        done
+        done <<< "$(db_list_users "xray" "$proto")"
     done
 
     # 遍历 Sing-box 用户（HY2 / TUIC / AnyTLS）
@@ -24859,7 +24877,7 @@ _reset_user_traffic() {
             read -rp "  确认重置所有用户流量? [y/N]: " confirm
             [[ ! "$confirm" =~ ^[yY]$ ]] && return
             
-            for user in $users; do
+            for user in "${user_array[@]}"; do
                 db_reset_user_traffic "$core" "$proto" "$user"
             done
             _ok "所有用户流量已重置"
