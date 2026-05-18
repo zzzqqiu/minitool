@@ -14896,14 +14896,30 @@ check_node_latency() {
     [[ -z "$resolved_ip" ]] && resolved_ip="-"
 
     local core=""
-    core=$(_pick_latency_core "$type") || { echo "超时|$resolved_ip"; return; }
+    core=$(_pick_latency_core "$type") || core=""
 
     local ip_mode="prefer_ipv4"
     [[ "$is_ipv6" == "true" ]] && ip_mode="prefer_ipv6"
 
-    if latency=$(_core_latency_test "$core" "$node" "$ip_mode"); then
-        echo "${latency}|${resolved_ip}"
+    if [[ -n "$core" ]]; then
+        if latency=$(_core_latency_test "$core" "$node" "$ip_mode"); then
+            echo "${latency}|${resolved_ip}"
+        else
+            # 核心测试失败，回退到简单 TCP 连通测试
+            local tcp_result=$(test_latency "$server" "$port" "$type")
+            if [[ "$tcp_result" =~ ^[0-9]+ms$ ]]; then
+                echo "${tcp_result}|${resolved_ip}"
+                return
+            fi
+            echo "超时|${resolved_ip}"
+        fi
     else
+        # 无可用核心，直接使用 TCP 连通测试
+        local tcp_result=$(test_latency "$server" "$port" "$type")
+        if [[ "$tcp_result" =~ ^[0-9]+ms$ ]]; then
+            echo "${tcp_result}|${resolved_ip}"
+            return
+        fi
         echo "超时|${resolved_ip}"
     fi
 }
