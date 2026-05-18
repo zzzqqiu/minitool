@@ -15398,6 +15398,21 @@ _parse_subscription_json() {
         local host=$(echo "$node" | jq -r '.host // .sni // ."ws-host" // ""' 2>/dev/null)
         local type=$(echo "$node" | jq -r '.type // .protocol // "vmess"' 2>/dev/null)
 
+        # 提取协议专属字段（面板 JSON 订阅可能包含）
+        local method=$(echo "$node" | jq -r '.method // ""' 2>/dev/null)
+        local password=$(echo "$node" | jq -r '.password // ""' 2>/dev/null)
+        local security=$(echo "$node" | jq -r '.security // ""' 2>/dev/null)
+        local sni=$(echo "$node" | jq -r '.sni // ""' 2>/dev/null)
+        local fp=$(echo "$node" | jq -r '.fp // .fingerprint // "chrome"' 2>/dev/null)
+        local pbk=$(echo "$node" | jq -r '.pbk // .publicKey // ""' 2>/dev/null)
+        local sid=$(echo "$node" | jq -r '.sid // .shortId // ""' 2>/dev/null)
+        local flow=$(echo "$node" | jq -r '.flow // ""' 2>/dev/null)
+        local encryption=$(echo "$node" | jq -r '.encryption // "none"' 2>/dev/null)
+        local aid=$(echo "$node" | jq -r '.aid // .alterId // 0' 2>/dev/null)
+        local insecure=$(echo "$node" | jq -r '.insecure // .allowInsecure // .allow_insecure // "0"' 2>/dev/null)
+        # 确保 aid 是有效数字（兼容 --argjson）
+        [[ ! "$aid" =~ ^[0-9]+$ ]] && aid=0
+
         port=$(echo "$port" | tr -d '"' | tr -d ' ')
         [[ ! "$port" =~ ^[0-9]+$ || -z "$server" || -z "$uuid" ]] && continue
 
@@ -15408,9 +15423,12 @@ _parse_subscription_json() {
         esac
 
         local result=$(jq -nc --arg n "$name" --arg t "$type" --arg s "$server" \
-            --argjson p "$port" --arg u "$uuid" --arg tls "$tls" \
+            --argjson p "$port" --arg u "$uuid" --arg tls_val "$tls" \
             --arg net "$net" --arg path "$path" --arg host "$host" \
-            '{name:$n,type:$t,server:$s,port:$p,uuid:$u,tls:$tls,network:$net,wsPath:$path,wsHost:$host}' 2>/dev/null)
+            --arg method "$method" --arg pw "$password" --arg sec "$security" --arg sni "$sni" \
+            --arg fp "$fp" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg enc "$encryption" \
+            --argjson aid "$aid" --arg insecure "$insecure" \
+            '{name:$n,type:$t,server:$s,port:$p,uuid:$u,tls:$tls_val,network:$net,wsPath:$path,wsHost:$host,method:$method,password:$pw,security:$sec,sni:$sni,fingerprint:$fp,publicKey:$pbk,shortId:$sid,flow:$flow,encryption:$enc,alterId:$aid,insecure:$insecure}' 2>/dev/null)
 
         [[ -n "$result" && "$result" != "null" ]] && { echo "$result"; ((count++)); }
     done <<< "$(echo "$nodes_json" | jq -c '.[]' 2>/dev/null)"
@@ -15809,6 +15827,23 @@ gen_singbox_chain_outbound() {
             local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg ds "$domain_strategy" \
                 '{tag:$tag,type:"hysteria2",server:$server,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni},domain_strategy:$ds}')
             [[ "$insecure" == "1" ]] && base=$(echo "$base" | jq '.tls.insecure=true')
+            echo "$base"
+            ;;
+        tuic)
+            # TUIC (UDP over QUIC) - Sing-box 原生支持
+            local uuid=$(echo "$node" | jq -r '.uuid')
+            local password=$(echo "$node" | jq -r '.password')
+            local sni=$(echo "$node" | jq -r '.sni // ""')
+            local insecure=$(echo "$node" | jq -r '.insecure // "0"')
+            [[ -z "$sni" ]] && sni="$server"
+            # 如果 password 为空（面板可能只有 uuid 字段），尝试用 uuid 作为密码
+            [[ -z "$password" ]] && password="$uuid"
+
+            local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg uuid "$uuid" --arg password "$password" --arg sni "$sni" --arg ds "$domain_strategy" \
+                '{tag:$tag,type:"tuic",server:$server,server_port:$port,uuid:$uuid,password:$password,tls:{enabled:true,server_name:$sni},domain_strategy:$ds}')
+            [[ "$insecure" == "1" || "$insecure" == "true" ]] && base=$(echo "$base" | jq '.tls.insecure=true')
+            [[ "$insecure" == "0" || "$insecure" == "false" ]] && base=$(echo "$base" | jq '.tls.insecure=false')
             echo "$base"
             ;;
         naive)
