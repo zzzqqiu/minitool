@@ -1387,6 +1387,7 @@ check_and_disable_expired_users() {
     [[ -z "$expired_users" ]] && echo "$count" && return 0
     
     defer_reload on
+    trap 'defer_reload off; trap - RETURN' RETURN
     while IFS='|' read -r core proto name expire_date days_left; do
         [[ -z "$name" ]] && continue
         db_set_user_enabled "$core" "$proto" "$name" false
@@ -1395,6 +1396,7 @@ check_and_disable_expired_users() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
     done <<< "$expired_users"
     defer_reload off
+    trap - RETURN
     
     [[ $count -gt 0 ]] && rebuild_and_reload_xray "silent" 2>/dev/null
     echo "$count"
@@ -9565,6 +9567,14 @@ generate_singbox_config() {
         # 添加 WireGuard endpoint（如果存在）
         if [[ "$warp_has_endpoint" == "true" ]]; then
             base_config=$(echo "$base_config" | jq --argjson ep "$warp_endpoint_data" '.endpoints = [$ep]')
+            local warp_endpoint_name=$(echo "$warp_endpoint_data" | jq -r '.name // "wg-warp"')
+            local warp_wireguard_out=$(jq -n --arg name "$warp_endpoint_name" '{
+                type: "wireguard",
+                tag: "warp",
+                endpoint: $name,
+                system: false
+            }')
+            base_config=$(echo "$base_config" | jq --argjson out "$warp_wireguard_out" '.outbounds = [$out] + .outbounds')
         fi
         
         # 添加路由规则
